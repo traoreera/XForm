@@ -171,6 +171,8 @@
 
                 const { form } = await client.public.getForm(slug);
 
+                console.log("Formulaire chargé :", form);
+
                 const renderer = new XFormRenderer(container, form, {
                     xformClient: client,
                     onSubmit: async (data, meta) => {

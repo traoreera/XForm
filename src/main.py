@@ -20,28 +20,23 @@ Routes HTTP (authentifiées) :
   GET    /forms/{form_id}/export       — export xlsx/csv/json
   GET    /forms/{form_id}/analytics    — statistiques
 """
+
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import mimetypes as _mimetypes
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-import mimetypes as _mimetypes
 
 from fastapi import Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
-
 from xcore.kernel.api.rbac import AuthPayload, get_current_user
-from xcore.sdk import (
-    AutoDispatchMixin,
-    RouterRegistry,
-    RoutedPlugin,
-    TrustedBase
-)
+from xcore.sdk import AutoDispatchMixin, RoutedPlugin, RouterRegistry, TrustedBase
 
+from .ipc import IPCCommands
 from .models.orm import Base
 from .repositories.store import XFormStore
 from .schemas.form import (
@@ -59,13 +54,11 @@ from .services.pipeline import XFormPipeline
 from .services.slug import unique_slug
 from .services.storage import (
     FileStorageError,
+    FileStorageService,
     FileTooLargeError,
     FileTypeNotAllowedError,
-    FileStorageService,
 )
 from .services.validator import XFormValidator
-from .ipc import IPCCommands
-
 
 logger = logging.getLogger("xform")
 router = RouterRegistry()
@@ -75,25 +68,26 @@ router = RouterRegistry()
 # Request bodies
 # ─────────────────────────────────────────────────────────────
 
+
 class CreateFormBody(BaseModel):
-    title:       str
+    title: str
     description: Optional[str] = None
-    fields:      List[Dict[str, Any]]
-    steps:       List[Dict[str, Any]] = []
-    settings:    Dict[str, Any] = {}
-    theme:       Dict[str, Any] = {}
-    tags:        List[str] = []
+    fields: List[Dict[str, Any]]
+    steps: List[Dict[str, Any]] = []
+    settings: Dict[str, Any] = {}
+    theme: Dict[str, Any] = {}
+    tags: List[str] = []
 
 
 class UpdateFormBody(BaseModel):
-    title:       Optional[str] = None
+    title: Optional[str] = None
     description: Optional[str] = None
-    fields:      Optional[List[Dict[str, Any]]] = None
-    steps:       Optional[List[Dict[str, Any]]] = None
-    settings:    Optional[Dict[str, Any]] = None
-    theme:       Optional[Dict[str, Any]] = None
-    status:      Optional[str] = None
-    tags:        Optional[List[str]] = None
+    fields: Optional[List[Dict[str, Any]]] = None
+    steps: Optional[List[Dict[str, Any]]] = None
+    settings: Optional[Dict[str, Any]] = None
+    theme: Optional[Dict[str, Any]] = None
+    status: Optional[str] = None
+    tags: Optional[List[str]] = None
 
 
 class SubmitBody(BaseModel):
@@ -102,6 +96,7 @@ class SubmitBody(BaseModel):
     Pour les champs fichier, la valeur = file_id retourné par /upload.
     Ex: { "data": { "nom": "Alice", "cv": "a1b2c3..." } }
     """
+
     data: Dict[str, Any]
     meta: Dict[str, Any] = {}
 
@@ -110,8 +105,8 @@ class SubmitBody(BaseModel):
 # Plugin principal
 # ─────────────────────────────────────────────────────────────
 
-class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
 
+class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
     # ── Lifecycle ─────────────────────────────────────────────
 
     async def on_load(self) -> None:
@@ -127,16 +122,16 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
 
         # Dossier data du plugin → plugins/xform/data/uploads/
         plugin_dir = Path(__file__).parent.parent
-        data_dir   = plugin_dir / "data"
+        data_dir = plugin_dir / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
 
         max_size_mb = int(self.ctx.env.get("MAX_FILE_SIZE_MB", "10"))
 
-        self._store     = XFormStore(self.db, self.cache)
+        self._store = XFormStore(self.db, self.cache)
         self._validator = XFormValidator()
-        self._exporter  = XFormExporter()
-        self._storage   = FileStorageService(data_dir=data_dir, max_size_mb=max_size_mb)
-        self._pipeline  = XFormPipeline(
+        self._exporter = XFormExporter()
+        self._storage = FileStorageService(data_dir=data_dir, max_size_mb=max_size_mb)
+        self._pipeline = XFormPipeline(
             store=self._store,
             call_plugin=self.call_plugin,
             events=self.ctx.events,
@@ -145,7 +140,8 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
         @self.ctx.health.register("xform.database")
         async def check_db():
             try:
-                await self.db.execute("SELECT 1")
+                with self.db() as db:
+                    db.execute("SELECT 1")
                 return True, "DB OK"
             except Exception as e:
                 return False, str(e)
@@ -173,15 +169,19 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
 
     def _ok(self, data: Optional[Dict[str, Any]] = None, **kwargs) -> dict:
         from xcore.kernel.api.contract import ok
+
         return ok(data, **kwargs)
 
     def _error(self, msg: str, code: Optional[str] = None, **kwargs) -> dict:
         from xcore.kernel.api.contract import error
+
         return error(msg, code, **kwargs)
 
-    async def _build_form(self, payload: Dict[str, Any], owner_id: str) -> FormDefinition:
+    async def _build_form(
+        self, payload: Dict[str, Any], owner_id: str
+    ) -> FormDefinition:
         fields = [FormField.model_validate(f) for f in (payload.get("fields") or [])]
-        steps  = [FormStep.model_validate(s)  for s in (payload.get("steps")  or [])]
+        steps = [FormStep.model_validate(s) for s in (payload.get("steps") or [])]
         slug = await unique_slug(
             payload.get("title", "form"),
             lambda s: self._store.slug_exists(s),
@@ -206,7 +206,9 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
 
     def _require_active(self, form: FormDefinition) -> None:
         if form.status != FormStatus.ACTIVE:
-            raise HTTPException(status_code=410, detail="Ce formulaire n'accepte plus de réponses.")
+            raise HTTPException(
+                status_code=410, detail="Ce formulaire n'accepte plus de réponses."
+            )
 
     async def _save_and_pipeline(
         self, form: FormDefinition, data: Dict[str, Any], meta: Dict[str, Any]
@@ -220,19 +222,24 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
         saved = await self._store.save_submission(submission)
         asyncio.create_task(self._pipeline.run(form, saved))
         return {
-            "status":        "ok",
+            "status": "ok",
             "submission_id": saved.id,
-            "message":       form.settings.confirmation_message,
-            "redirect_url":  form.settings.redirect_url,
+            "message": form.settings.confirmation_message,
+            "redirect_url": form.settings.redirect_url,
         }
 
-    def _validate_file_refs(self, form: FormDefinition, data: Dict[str, Any]) -> None:
+    async def _validate_file_refs(
+        self, form: FormDefinition, data: Dict[str, Any]
+    ) -> None:
         """Vérifie que tous les file_ids référencés existent sur disque."""
         for field in form.fields:
             if field.type.value != "file":
                 continue
             file_id = data.get(field.name) or data.get(field.id)
             if file_id and isinstance(file_id, str):
+                response = await self.call_plugin(
+                    "form_files", "form.exist", {"file_id": file_id, "form_id": form.id}
+                )
                 if not self._storage.exists(file_id, form.id):
                     raise HTTPException(
                         status_code=422,
@@ -241,6 +248,7 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
                             "Uploadez le fichier d'abord via /public/{slug}/upload."
                         ),
                     )
+
     # ─────────────────────────────────────────────────────────
     # Routes HTTP — Authentifiées
     # ─────────────────────────────────────────────────────────
@@ -253,10 +261,14 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
         limit: int = 50,
         offset: int = 0,
     ) -> dict:
-        return await self.ipc_list_forms({
-            "owner_id": current_user["sub"], "status": status,
-            "limit": limit, "offset": offset,
-        })
+        return await self.ipc_list_forms(
+            {
+                "owner_id": current_user["sub"],
+                "status": status,
+                "limit": limit,
+                "offset": offset,
+            }
+        )
 
     @router.post("/forms", tags=["xform"])
     async def http_create_form(
@@ -270,7 +282,8 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
 
     @router.get("/forms/{form_id}", tags=["xform"])
     async def http_get_form(
-        self, form_id: str,
+        self,
+        form_id: str,
         current_user: AuthPayload = Depends(get_current_user),
     ) -> dict:
         return await self.ipc_get_form({"form_id": form_id})
@@ -288,7 +301,8 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
 
     @router.delete("/forms/{form_id}", tags=["xform"])
     async def http_delete_form(
-        self, form_id: str,
+        self,
+        form_id: str,
         current_user: AuthPayload = Depends(get_current_user),
     ) -> dict:
         return await self.ipc_delete_form({"form_id": form_id})
@@ -302,14 +316,19 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
         limit: int = 50,
         offset: int = 0,
     ) -> dict:
-        return await self.ipc_list_submissions({
-            "form_id": form_id, "status": status,
-            "limit": limit, "offset": offset,
-        })
+        return await self.ipc_list_submissions(
+            {
+                "form_id": form_id,
+                "status": status,
+                "limit": limit,
+                "offset": offset,
+            }
+        )
 
     @router.get("/forms/{form_id}/analytics", tags=["xform"])
     async def http_analytics(
-        self, form_id: str,
+        self,
+        form_id: str,
         current_user: AuthPayload = Depends(get_current_user),
     ) -> dict:
         return await self.ipc_analytics({"form_id": form_id})
@@ -330,18 +349,24 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
             return Response(
                 content=content,
                 media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                headers={"Content-Disposition": f'attachment; filename="{form.slug}_export.xlsx"'},
+                headers={
+                    "Content-Disposition": f'attachment; filename="{form.slug}_export.xlsx"'
+                },
             )
         elif format == "csv":
             return Response(
                 content=self._exporter.export_csv(form, subs).encode("utf-8"),
                 media_type="text/csv",
-                headers={"Content-Disposition": f'attachment; filename="{form.slug}_export.csv"'},
+                headers={
+                    "Content-Disposition": f'attachment; filename="{form.slug}_export.csv"'
+                },
             )
         return Response(
             content=self._exporter.export_json(form, subs).encode("utf-8"),
             media_type="application/json",
-            headers={"Content-Disposition": f'attachment; filename="{form.slug}_export.json"'},
+            headers={
+                "Content-Disposition": f'attachment; filename="{form.slug}_export.json"'
+            },
         )
 
     # ── Télécharger un fichier uploadé ────────────────────────
@@ -360,7 +385,9 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
         form = await self._store.get_form(form_id)
         if not form:
             raise HTTPException(status_code=404, detail="Formulaire introuvable.")
-        if form.owner_id != current_user["sub"] and "admin" not in current_user.get("roles", []):
+        if form.owner_id != current_user["sub"] and "admin" not in current_user.get(
+            "roles", []
+        ):
             raise HTTPException(status_code=403, detail="Accès non autorisé.")
 
         content = self._storage.read(file_id, form_id)
@@ -395,26 +422,28 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
         self._get_form_or_404(form)
         self._require_active(form)
 
-        asyncio.create_task(self._store.track_view(
-            form_id=form.id,
-            ip=request.client.host if request.client else "",
-            user_agent=request.headers.get("user-agent", ""),
-        ))
+        asyncio.create_task(
+            self._store.track_view(
+                form_id=form.id,
+                ip=request.client.host if request.client else "",
+                user_agent=request.headers.get("user-agent", ""),
+            )
+        )
 
         return {
             "status": "ok",
             "form": {
-                "id":            form.id,
-                "title":         form.title,
-                "description":   form.description,
-                "fields":        [f.model_dump(mode="json") for f in form.fields],
-                "steps":         [s.model_dump(mode="json") for s in form.steps],
+                "id": form.id,
+                "title": form.title,
+                "description": form.description,
+                "fields": [f.model_dump(mode="json") for f in form.fields],
+                "steps": [s.model_dump(mode="json") for s in form.steps],
                 "settings": {
-                    "multi_step":           form.settings.multi_step,
+                    "multi_step": form.settings.multi_step,
                     "confirmation_message": form.settings.confirmation_message,
-                    "redirect_url":         form.settings.redirect_url,
+                    "redirect_url": form.settings.redirect_url,
                 },
-                "theme":         form.theme.model_dump(mode="json"),
+                "theme": form.theme.model_dump(mode="json"),
                 # Indique au SDK/frontend quels champs nécessitent un upload préalable
                 "has_file_fields": any(f.type.value == "file" for f in form.fields),
             },
@@ -424,8 +453,8 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
     async def http_public_upload_file(
         self,
         slug: str,
-        field_name: str     = Form(..., description="Nom du champ fichier (field.name)"),
-        file: UploadFile    = File(..., description="Fichier à uploader"),
+        field_name: str = Form(..., description="Nom du champ fichier (field.name)"),
+        file: UploadFile = File(..., description="Fichier à uploader"),
     ) -> dict:
         """
         Étape 1 — Upload d'UN fichier avant soumission.
@@ -446,9 +475,13 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
         # Vérifier que le champ existe et est de type file
         field = form.get_field_by_name(field_name)
         if not field:
-            raise HTTPException(400, f"Champ '{field_name}' introuvable dans ce formulaire.")
+            raise HTTPException(
+                400, f"Champ '{field_name}' introuvable dans ce formulaire."
+            )
         if field.type.value != "file":
-            raise HTTPException(400, f"Le champ '{field_name}' n'est pas un champ fichier.")
+            raise HTTPException(
+                400, f"Le champ '{field_name}' n'est pas un champ fichier."
+            )
 
         content = await file.read()
         if not content:
@@ -477,15 +510,19 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
 
         logger.info(
             "Upload OK : form=%s field=%s file_id=%s name=%s size=%d",
-            form.id, field_name, uploaded.file_id, uploaded.original_name, uploaded.size_bytes,
+            form.id,
+            field_name,
+            uploaded.file_id,
+            uploaded.original_name,
+            uploaded.size_bytes,
         )
 
         return {
-            "status":        "ok",
-            "file_id":       uploaded.file_id,
+            "status": "ok",
+            "file_id": uploaded.file_id,
             "original_name": uploaded.original_name,
-            "size_bytes":    uploaded.size_bytes,
-            "mime_type":     uploaded.mime_type,
+            "size_bytes": uploaded.size_bytes,
+            "mime_type": uploaded.mime_type,
         }
 
     @router.post("/public/{slug}/submit", tags=["xform-public"])
@@ -501,7 +538,7 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
         Les valeurs des champs fichier = file_id retourné par /upload.
         """
         meta = dict(body.meta)
-        meta["ip"]         = request.client.host if request.client else ""
+        meta["ip"] = request.client.host if request.client else ""
         meta["user_agent"] = request.headers.get("user-agent", "")
         return await self.ipc_submit({"slug": slug, "data": body.data, "meta": meta})
 
@@ -533,7 +570,7 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
 
         data: Dict[str, Any] = {}
         meta: Dict[str, Any] = {
-            "ip":         request.client.host if request.client else "",
+            "ip": request.client.host if request.client else "",
             "user_agent": request.headers.get("user-agent", ""),
         }
         file_field_names = {f.name for f in form.fields if f.type.value == "file"}
@@ -561,10 +598,12 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
                     continue
 
                 if field.max_size_mb and len(content) > field.max_size_mb * 1024 * 1024:
-                    upload_errors.append({
-                        "field_name": key,
-                        "message": f"Fichier trop volumineux pour « {field.label} » (max {field.max_size_mb}MB).",
-                    })
+                    upload_errors.append(
+                        {
+                            "field_name": key,
+                            "message": f"Fichier trop volumineux pour « {field.label} » (max {field.max_size_mb}MB).",
+                        }
+                    )
                     continue
 
                 try:
@@ -575,7 +614,9 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
                         field_name=key,
                     )
                     data[key] = uploaded.file_id
-                    logger.info("Multipart upload: field=%s file_id=%s", key, uploaded.file_id)
+                    logger.info(
+                        "Multipart upload: field=%s file_id=%s", key, uploaded.file_id
+                    )
                 except FileTooLargeError as e:
                     upload_errors.append({"field_name": key, "message": str(e)})
                 except FileTypeNotAllowedError as e:
@@ -601,16 +642,21 @@ class Plugin(RoutedPlugin, IPCCommands, TrustedBase):
         if upload_errors:
             raise HTTPException(
                 422,
-                {"message": "Erreurs lors de l'upload des fichiers.", "errors": upload_errors},
+                {
+                    "message": "Erreurs lors de l'upload des fichiers.",
+                    "errors": upload_errors,
+                },
             )
 
         # Vérifier les file_ids
-        self._validate_file_refs(form, data)
+        await self._validate_file_refs(form, data)
 
         # Validation champs texte
         valid, errors = self._validator.validate(form, data)
         if not valid:
-            raise HTTPException(422, {"message": "Données invalides.", "errors": errors})
+            raise HTTPException(
+                422, {"message": "Données invalides.", "errors": errors}
+            )
 
         return await self._save_and_pipeline(form, data, meta)
 
